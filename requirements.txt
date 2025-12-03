@@ -1,0 +1,4 @@
+feedparser
+pymupdf
+apscheduler
+aiohttp

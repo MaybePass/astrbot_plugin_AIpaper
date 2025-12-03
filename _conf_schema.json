@@ -1,0 +1,27 @@
+{
+  "target_groups": {
+    "description": "每日推送的目标群号列表，多个群号用英文逗号分隔 (例如: 123456,789012)",
+    "type": "string",
+    "default": ""
+  },
+  "push_time": {
+    "description": "每日推送时间 (HH:MM)",
+    "type": "string",
+    "default": "09:00"
+  },
+  "proxy": {
+    "description": "访问 ArXiv 的 HTTP 代理地址 (如 http://127.0.0.1:7890)，留空则不使用代理",
+    "type": "string",
+    "default": ""
+  },
+  "extra_message": {
+    "description": "合并转发消息中的第三条额外内容（如广告、免责声明等），留空则不发送",
+    "type": "text",
+    "default": ""
+  },
+  "prompt_template": {
+    "description": "AI 总结提示词模板。可用变量: {title}, {abstract}, {full_text}, {authors}",
+    "type": "text",
+    "default": "你是一个专业的 AI 论文解读助手。\n\n论文标题: {title}\n作者: {authors}\n摘要: {abstract}\n\n论文内容片段:\n{full_text}\n\n请严格按照以下 Markdown 格式输出，不要输出其他寒暄语：\n\n## 💡 核心创新点\n(简要概括)\n\n## 📖 论文概要\n(通俗解释这篇论文解决了什么问题，用了什么方法)\n\n## 👥 作者背景\n(根据作者姓名简要介绍其所属机构或知名代表作，如果无法确定则略过)\n\n## 🔬 关键结论\n(实验结果或理论贡献)"
+  }
+}
