@@ -3,7 +3,6 @@ import json
 import re
 import asyncio
 import aiohttp
-from datetime import datetime
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # 导入 fitz 和 feedparser，但不在主线程直接调用耗时操作
@@ -14,8 +13,8 @@ from astrbot.api import star, logger
 from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter, MessageChain
 from astrbot.api.message_components import Plain, Image, Node, Nodes, BaseMessageComponent
 from astrbot.api.star import StarTools
-from astrbot.core.platform.astr_message_event import MessageSession
-from astrbot.core.platform.message_type import MessageType
+from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
+from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_platform_adapter import AiocqhttpAdapter
 
 class Main(star.Star):
     def __init__(self, context: star.Context, config: dict = None):
@@ -44,8 +43,7 @@ class Main(star.Star):
         )
         self.prompt_template = self.config.get("prompt_template", default_prompt)
 
-        # 2. 数据持久化规范 (StarTools.get_data_dir)
-        # 使用插件名作为目录名，AstrBot 会自动在 data/plugin_data/ 下创建
+        # 2. 数据持久化规范
         self.data_dir = StarTools.get_data_dir("astrbot_plugin_daily_paper")
         self.history_file = os.path.join(self.data_dir, "history.json")
         self.temp_dir = os.path.join(self.data_dir, "temp")
@@ -66,7 +64,6 @@ class Main(star.Star):
             logger.error(f"定时任务启动失败，请检查时间格式(HH:MM): {e}")
 
     def _parse_target_groups(self, config_val):
-        """解析目标群组，支持字符串或列表"""
         if not config_val:
             return []
         if isinstance(config_val, list):
@@ -85,9 +82,6 @@ class Main(star.Star):
         return []
 
     def _save_history(self):
-        # 放在同步方法里调用，但在实际写入时考虑放入线程池（虽然写小json很快，但为了最佳实践）
-        # 这里为了简化，我们假设数据量不大。如果严格遵循规范：
-        # asyncio.create_task(asyncio.to_thread(self._write_history_sync))
         try:
             with open(self.history_file, 'w', encoding='utf-8') as f:
                 json.dump(self.history, f)
@@ -100,23 +94,24 @@ class Main(star.Star):
         return await asyncio.to_thread(feedparser.parse, data)
 
     async def _process_pdf_in_thread(self, pdf_path, img_path):
-        """在线程池中处理 PDF，避免阻塞主循环"""
         def _heavy_work():
             doc = None
             try:
+                logger.debug(f"[PDF解析] 开始处理: {pdf_path}")
                 doc = fitz.open(pdf_path)
-                # 提取前2页文本
                 text_content = ""
+                # 提取前2页文本
                 for page in doc[:2]: 
                     text_content += page.get_text()
                 
-                # 第一页转图片
+                # 生成第一页预览图
                 page = doc.load_page(0)
                 pix = page.get_pixmap(dpi=150)
                 pix.save(img_path)
+                logger.info(f"[PDF解析] 预览图已保存至: {img_path}")
                 return text_content
             except Exception as e:
-                logger.error(f"Fitz processing error: {e}")
+                logger.error(f"[PDF解析] PyMuPDF处理失败: {e}")
                 return None
             finally:
                 if doc:
@@ -136,7 +131,6 @@ class Main(star.Star):
                         logger.error(f"ArXiv API error: {response.status}")
                         return None
                     data = await response.text()
-                    # 使用线程池解析 Feed
                     return await self._parse_feed_in_thread(data)
             except Exception as e:
                 logger.error(f"Network error fetching arxiv: {e}")
@@ -187,49 +181,100 @@ class Main(star.Star):
             "pdf_link": entry.link.replace("abs", "pdf")
         }
 
-    async def process_pdf(self, pdf_url, paper_id):
-        """下载并处理 PDF"""
+    async def process_pdf(self, pdf_url, paper_id, max_retries=3):
+        """下载并处理 PDF (增强版，含重试与详细日志)"""
         pdf_path = os.path.join(self.temp_dir, f"{paper_id}.pdf")
         img_path = os.path.join(self.temp_dir, f"{paper_id}.png")
         
-        # 增强 PDF 下载逻辑：增加 Headers，处理超时
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'application/pdf,text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Connection': 'keep-alive',
         }
         
-        connector = aiohttp.TCPConnector(ssl=False)
-        async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
+        for attempt in range(max_retries):
             try:
-                logger.info(f"Downloading PDF from: {pdf_url}")
-                # 增加超时时间到 90s，部分 PDF 下载较慢
-                async with session.get(pdf_url, proxy=self.proxy, timeout=90) as resp:
-                    if resp.status == 200:
-                        # 使用异步文件写入
-                        content = await resp.read()
-                        # 写入文件是 I/O 操作，虽然小文件可以接受，但大文件最好也放线程池
-                        # 这里为了简化直接写，因为是内存 -> 磁盘
+                logger.info(f"[PDF下载] 尝试 {attempt+1}/{max_retries}，ID: {paper_id}")
+                logger.debug(f"[PDF下载] URL: {pdf_url}, 代理: {self.proxy}")
+                
+                connector = aiohttp.TCPConnector(ssl=False)
+                timeout = aiohttp.ClientTimeout(total=120, connect=30, sock_read=60)
+                
+                async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                    async with session.get(
+                        pdf_url,
+                        headers=headers,
+                        proxy=self.proxy,
+                        allow_redirects=True
+                    ) as resp:
+                        status = resp.status
+                        content_type = resp.headers.get('Content-Type', '')
+                        
+                        # 关键诊断日志
+                        logger.info(f"[PDF下载] 响应状态: {status}, Content-Type: {content_type}")
+                        
+                        # 状态码检查
+                        if status not in (200, 201, 202, 203, 206):
+                            logger.warning(f"[PDF下载] 非成功状态码 {status}，等待后重试...")
+                            if status == 403:
+                                logger.error("[PDF下载] 403 Forbidden: 可能触发了反爬，请检查 User-Agent 或尝试更换 IP。")
+                            await asyncio.sleep(2 ** attempt)
+                            continue
+
+                        # 内容类型检查（非强制，仅警告）
+                        if 'application/pdf' not in content_type:
+                             logger.warning(f"[PDF下载] Content-Type 为 {content_type}，可能不是 PDF 文件 (也可能是服务器配置问题)，继续尝试下载...")
+
+                        # 流式写入文件
+                        total_size = 0
                         with open(pdf_path, 'wb') as f:
-                            f.write(content)
-                        logger.info(f"PDF Downloaded: {len(content)} bytes")
-                    else:
-                        logger.error(f"PDF download status: {resp.status}")
-                        return None, None
+                            async for chunk in resp.content.iter_chunked(1024 * 1024):
+                                if chunk:
+                                    f.write(chunk)
+                                    total_size += len(chunk)
+                        
+                        logger.info(f"[PDF下载] 文件已保存: {pdf_path}, 大小: {total_size} 字节")
+                        
+                        # 在线程池中处理 PDF 解析
+                        text_content = await self._process_pdf_in_thread(pdf_path, img_path)
+                        
+                        # 清理临时PDF文件
+                        if os.path.exists(pdf_path):
+                            try:
+                                os.remove(pdf_path)
+                            except Exception:
+                                pass
+                        
+                        if not text_content:
+                            logger.error(f"[PDF下载] PDF解析返回空文本")
+                            # 如果解析失败，清理图片并重试
+                            if os.path.exists(img_path):
+                                try:
+                                    os.remove(img_path)
+                                except Exception:
+                                    pass
+                            await asyncio.sleep(2)
+                            continue
+                        
+                        logger.info(f"[PDF下载] 成功！")
+                        return text_content, img_path
+                        
+            except aiohttp.ClientError as e:
+                logger.warning(f"[PDF下载] 网络客户端错误 (尝试 {attempt+1}): {e}")
+            except asyncio.TimeoutError:
+                logger.warning(f"[PDF下载] 请求超时 (尝试 {attempt+1})")
             except Exception as e:
-                logger.error(f"PDF Download failed: {e}")
-                return None, None
-        
-        # 在线程池中处理 PDF 解析
-        text_content = await self._process_pdf_in_thread(pdf_path, img_path)
-        
-        # 清理 PDF 文件
-        if os.path.exists(pdf_path):
-            os.remove(pdf_path)
+                logger.error(f"[PDF下载] 未知错误 (尝试 {attempt+1}): {e}", exc_info=True)
             
-        if not text_content:
-            logger.error("PDF parsing returned empty text")
-            return None, None
-            
-        return text_content, img_path
+            # 重试前等待
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt
+                logger.info(f"[PDF下载] 等待 {wait_time} 秒后重试...")
+                await asyncio.sleep(wait_time)
+        
+        logger.error(f"[PDF下载] 失败，已达最大重试次数: {max_retries}")
+        return None, None
 
     async def translate_title(self, title):
         provider = self.context.get_using_provider()
@@ -270,55 +315,47 @@ class Main(star.Star):
         """使用通用接口广播到配置的群组"""
         if not self.target_groups:
             return
-            
-        # 获取所有平台实例
+        
+        # 优先寻找 aiocqhttp 适配器
         platforms = self.context.platform_manager.get_insts()
+        adapter = next((p for p in platforms if isinstance(p, AiocqhttpAdapter)), None)
         
-        # 优先寻找 aiocqhttp 适配器 (QQ)，因为目前主要针对 QQ 群
-        # 如果未来要支持其他平台，这里需要修改逻辑来匹配群号所属的平台
-        target_platform = None
-        for p in platforms:
-            if p.meta().name == "aiocqhttp" or p.meta().name == "napcat":
-                 target_platform = p
-                 break
-        
-        if not target_platform:
-            logger.error("未找到支持 QQ 群消息的平台适配器 (aiocqhttp/napcat)。")
+        if not adapter:
+            logger.error("未找到 aiocqhttp (QQ) 适配器，无法发送群消息。")
             return
-
-        platform_id = target_platform.meta().id # 平台实例ID
 
         for group_id in self.target_groups:
             try:
                 logger.info(f"正在发送到群: {group_id}")
-                # 构造 UMO 字符串: platform_id:GroupMessage:group_id
-                # 注意：aiocqhttp 的 session_id 通常就是 group_id
-                
-                # 使用 context.send_message 发送
-                # 这需要构造一个 MessageSession 对象或者符合格式的字符串
-                session_str = f"{platform_id}:GroupMessage:{group_id}"
-                
-                await self.context.send_message(session_str, message_chain)
-                
-                # 避免风控
+                await AiocqhttpMessageEvent.send_message(
+                    bot=adapter.bot,
+                    message_chain=message_chain,
+                    is_group=True,
+                    session_id=group_id
+                )
                 await asyncio.sleep(2) 
             except Exception as e:
                 logger.error(f"发送到群 {group_id} 失败: {e}")
 
     async def _execute_push(self, paper, target_umo=None, is_manual=False, silent_start=False):
         """执行推送逻辑"""
-        
-        # 1. 发送提示
-        if not silent_start and (is_manual or self.target_groups):
-            start_msg = MessageChain([Plain(f"📄 正在获取论文: {paper['title']} ...")])
-            if is_manual and target_umo:
-                await self.context.send_message(target_umo, start_msg)
-            elif not is_manual:
-                await self._broadcast_to_groups(start_msg)
-        
-        # 2. 处理内容 (try-finally 确保清理)
+        # 变量初始化，防止 except 块访问未定义变量
+        raw_text = None
         img_path = None
+        cn_title = None
+        display_title = None
+        explanation = None
+        
         try:
+            # 1. 发送提示
+            if not silent_start and (is_manual or self.target_groups):
+                start_msg = MessageChain([Plain(f"📄 正在获取论文: {paper['title']} ...")])
+                if is_manual and target_umo:
+                    await self.context.send_message(target_umo, start_msg)
+                elif not is_manual:
+                    await self._broadcast_to_groups(start_msg)
+            
+            # 2. 处理内容 (下载 + 翻译)
             pdf_task = self.process_pdf(paper['pdf_link'], paper['id'])
             trans_task = self.translate_title(paper['title'])
             
@@ -326,11 +363,11 @@ class Main(star.Star):
             (raw_text, img_path), cn_title = results
             
             if not raw_text or not img_path:
-                err_msg = MessageChain([Plain("⚠️ PDF 下载或解析失败，请检查网络配置或代理设置。")])
+                err_msg = MessageChain([Plain("⚠️ PDF 下载或解析失败，请检查日志获取详情。")])
                 if is_manual and target_umo:
                     await self.context.send_message(target_umo, err_msg)
                 elif not is_manual:
-                    await self._broadcast_to_groups(err_msg)
+                    logger.error("PDF 处理失败，已停止推送")
                 return
 
             # 3. 生成总结
@@ -368,46 +405,50 @@ class Main(star.Star):
                 all_nodes.append(node3)
             
             # 5. 发送消息
-            try:
-                nodes_component = Nodes(all_nodes)
-                forward_msg = MessageChain([nodes_component])
-                end_msg = MessageChain([Plain("📅 今日 AI 论文已送达~")])
+            nodes_component = Nodes(all_nodes)
+            forward_msg = MessageChain([nodes_component])
+            end_msg = MessageChain([Plain("📅 今日 AI 论文已送达~")])
+            
+            if is_manual and target_umo:
+                await self.context.send_message(target_umo, forward_msg)
+                if self.extra_message: 
+                     pass 
+            elif not is_manual:
+                await self._broadcast_to_groups(forward_msg)
+                await asyncio.sleep(2)
+                await self._broadcast_to_groups(end_msg)
+            
+            # 记录历史
+            if not is_manual:
+                self.history.append(paper['id'])
+                self._save_history()
+            
+            logger.info(f"论文 {paper['title']} 推送成功")
                 
-                if is_manual and target_umo:
-                    await self.context.send_message(target_umo, forward_msg)
-                    if self.extra_message: # 只有在手动模式下，为了不打扰，我们只在有额外消息时才发第二条，或者根据需求调整
-                         pass # 手动模式就不发 "今日已送达" 了
-                elif not is_manual:
-                    # 定时任务广播
-                    await self._broadcast_to_groups(forward_msg)
-                    await asyncio.sleep(2)
-                    await self._broadcast_to_groups(end_msg)
-                
-                # 记录历史
-                if not is_manual:
-                    self.history.append(paper['id'])
-                    self._save_history()
-                
-                logger.info(f"论文 {paper['title']} 推送成功")
-                    
-            except Exception as e:
-                logger.error(f"消息发送失败 (尝试降级发送): {e}")
-                # 降级: 拆开发送
-                fallback_chain = MessageChain([
-                    Plain(f"📄 {display_title}\n{paper['link']}\n\n"),
-                    Image.fromFileSystem(img_path),
-                    Plain(f"\n\n{explanation}")
-                ])
-                if self.extra_message:
-                    fallback_chain.chain.append(Plain(f"\n\n{self.extra_message}"))
+        except Exception as e:
+            logger.error(f"消息发送失败: {e}")
+            # 降级逻辑：先检查变量是否存在
+            if display_title and img_path and explanation:
+                try:
+                    fallback_chain = MessageChain([
+                        Plain(f"📄 {display_title}\n{paper['link']}\n\n"),
+                        Image.fromFileSystem(img_path),
+                        Plain(f"\n\n{explanation}")
+                    ])
+                    if self.extra_message:
+                        fallback_chain.chain.append(Plain(f"\n\n{self.extra_message}"))
 
-                if is_manual and target_umo:
-                    await self.context.send_message(target_umo, fallback_chain)
-                elif not is_manual:
-                    await self._broadcast_to_groups(fallback_chain)
+                    if is_manual and target_umo:
+                        await self.context.send_message(target_umo, fallback_chain)
+                    elif not is_manual:
+                        await self._broadcast_to_groups(fallback_chain)
+                except Exception as e2:
+                    logger.error(f"降级发送也失败了: {e2}")
+            else:
+                logger.error("关键数据缺失，无法执行降级发送。")
                     
         finally:
-            # 5. 清理临时文件
+            # 6. 清理临时图片
             if img_path and os.path.exists(img_path):
                 try:
                     os.remove(img_path)
@@ -454,7 +495,6 @@ class Main(star.Star):
         # 更新配置
         plugin_md = self.context.get_registered_star("astrbot_plugin_daily_paper")
         if plugin_md and plugin_md.config:
-             # 保存为字符串格式，逗号分隔
              plugin_md.config["target_groups"] = ",".join(self.target_groups)
              plugin_md.config.save_config()
         
@@ -481,13 +521,10 @@ class Main(star.Star):
     @filter.command("paper_push_now")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def push_now(self, event: AstrMessageEvent):
-        """立即触发自动推送 (手动测试)"""
-        # 移除“正在触发...”回复
-        
+        """立即触发自动推送"""
         paper = await self.fetch_latest_paper()
         if not paper:
             yield event.plain_result("没有获取到新的待推送论文。")
             return
             
-        # is_manual=True, silent_start=False (显示“正在获取”)
         await self._execute_push(paper, target_umo=event.unified_msg_origin, is_manual=True, silent_start=False)
