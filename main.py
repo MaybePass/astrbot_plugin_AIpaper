@@ -381,7 +381,7 @@ class Main(star.Star):
             node1 = Node(name="论文预览", uin=self_uin, content=node1_content)
             
             node2_content: list[BaseMessageComponent] = [
-                Plain(f"🤖 AI 深度解读\n\n{explanation}")
+                Plain(f"解读一下~\n\n{explanation}")
             ]
             node2 = Node(name="AI 助手", uin=self_uin, content=node2_content)
             
@@ -394,7 +394,7 @@ class Main(star.Star):
             
             nodes_component = Nodes(all_nodes)
             forward_msg = MessageChain([nodes_component])
-            end_msg = MessageChain([Plain("📅 今日 AI 论文已送达~")])
+            end_msg = MessageChain([Plain("今日 AI 论文已送达~")])
             
             # 5. 发送消息
             if is_manual and target_umo:
@@ -507,3 +507,4 @@ class Main(star.Star):
         # 手动触发测试：静默开始 (按你的要求)
         # 因为是 push_now 模拟自动推送，所以我们使用 silent_start=True
         await self._execute_push(paper, target_umo=event.unified_msg_origin, is_manual=True, silent_start=True)
+
