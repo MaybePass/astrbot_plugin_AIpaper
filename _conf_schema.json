@@ -9,11 +9,6 @@
     "type": "string",
     "default": "09:00"
   },
-  "proxy": {
-    "description": "访问 ArXiv 的 HTTP 代理地址 (如 http://127.0.0.1:7890)，留空则不使用代理",
-    "type": "string",
-    "default": ""
-  },
   "extra_message": {
     "description": "合并转发消息中的第三条额外内容（如广告、免责声明等），留空则不发送",
     "type": "text",
